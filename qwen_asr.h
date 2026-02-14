@@ -249,8 +249,9 @@ typedef struct {
 typedef struct {
     /* Written by reader thread under mutex */
     float *samples;
-    int n_samples;
-    int capacity;
+    int64_t sample_offset;      /* global index of samples[0] */
+    int64_t n_samples;          /* number of valid samples in buffer */
+    int64_t capacity;           /* allocated capacity (in samples) */
     int eof;
     pthread_mutex_t mutex;
     pthread_cond_t cond;
@@ -317,5 +318,9 @@ int qwen_decoder_forward(qwen_ctx_t *ctx, const float *input_embed);
 
 /* Global verbose flag */
 extern int qwen_verbose;
+
+/* Monitor mode: show inline Unicode symbols on stderr for streaming diagnostics.
+ * Symbols: ▶ encoder  · prefill  ▪ decode  ▸ slow decode  ⟳ window eviction */
+extern int qwen_monitor;
 
 #endif /* QWEN_ASR_H */

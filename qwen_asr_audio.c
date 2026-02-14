@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <limits.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -400,10 +401,17 @@ float *qwen_mel_spectrogram(const float *samples, int n_samples, int *out_frames
 
 /* Append n_new float samples to la->samples under mutex + signal condvar. */
 static void live_audio_append(qwen_live_audio_t *la, const float *data, int n_new) {
+    if (!la || !data || n_new <= 0) return;
+
     pthread_mutex_lock(&la->mutex);
-    if (la->n_samples + n_new > la->capacity) {
-        int new_cap = la->capacity > 0 ? la->capacity : 32000;
-        while (new_cap < la->n_samples + n_new) new_cap *= 2;
+    int64_t need = la->n_samples + (int64_t)n_new;
+    if (need > la->capacity) {
+        int64_t new_cap = la->capacity > 0 ? la->capacity : 32000;
+        while (new_cap < need) new_cap *= 2;
+        if ((uint64_t)new_cap > (uint64_t)(SIZE_MAX / sizeof(float))) {
+            pthread_mutex_unlock(&la->mutex);
+            return;
+        }
         float *tmp = (float *)realloc(la->samples, (size_t)new_cap * sizeof(float));
         if (!tmp) {
             pthread_mutex_unlock(&la->mutex);
@@ -412,7 +420,7 @@ static void live_audio_append(qwen_live_audio_t *la, const float *data, int n_ne
         la->samples = tmp;
         la->capacity = new_cap;
     }
-    memcpy(la->samples + la->n_samples, data, (size_t)n_new * sizeof(float));
+    memcpy(la->samples + (size_t)la->n_samples, data, (size_t)n_new * sizeof(float));
     la->n_samples += n_new;
     pthread_cond_signal(&la->cond);
     pthread_mutex_unlock(&la->mutex);

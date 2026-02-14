@@ -65,6 +65,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --prompt <text>            System prompt for biasing (example: \"Preserve spelling: CPU, CUDA, PostgreSQL, Redis\")\n");
     fprintf(stderr, "  --language <lang>          Force output language via token conditioning\n");
     fprintf(stderr, "                             (usually auto-detected if omitted)\n");
+    fprintf(stderr, "  --monitor     Show inline Unicode symbols on stderr (streaming diagnostics)\n");
     fprintf(stderr, "  --debug       Debug output (per-layer details)\n");
     fprintf(stderr, "  --silent      No status output (only transcription on stdout)\n");
     fprintf(stderr, "  -h            Show this help\n");
@@ -121,6 +122,8 @@ int main(int argc, char **argv) {
             force_language = argv[++i];
         } else if (strcmp(argv[i], "--stdin") == 0) {
             use_stdin = 1;
+        } else if (strcmp(argv[i], "--monitor") == 0) {
+            qwen_monitor = 1;
         } else if (strcmp(argv[i], "--debug") == 0) {
             verbosity = 2;
         } else if (strcmp(argv[i], "--silent") == 0) {

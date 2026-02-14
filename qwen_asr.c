@@ -15,10 +15,12 @@
 #include <string.h>
 #include <ctype.h>
 #include <math.h>
+#include <limits.h>
 #include <sys/time.h>
 
 /* Global verbose flag */
 int qwen_verbose = 0;
+int qwen_monitor = 0;
 
 void qwen_set_token_callback(qwen_ctx_t *ctx, qwen_token_cb cb, void *userdata) {
     ctx->token_cb = cb;
@@ -1072,7 +1074,7 @@ static int stream_encode_span(qwen_ctx_t *ctx, const float *samples, int n_sampl
 }
 
 typedef struct {
-    int start_sample;
+    int64_t start_sample;
     int n_samples;
     int seq_len;
     float *enc_output; /* [seq_len, dec_hidden] */
@@ -1111,44 +1113,64 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
     int max_new_tokens = ctx->stream_max_new_tokens > 0 ? ctx->stream_max_new_tokens : 32;
 
     const float *audio_samples = samples;
-    int audio_n_samples = n_samples;
+    int64_t audio_n_samples = n_samples;
     float *compacted_samples = NULL;
     if (!live && ctx->skip_silence) {
-        compacted_samples = compact_silence(samples, n_samples, &audio_n_samples);
+        int compacted_n = n_samples;
+        compacted_samples = compact_silence(samples, n_samples, &compacted_n);
         if (compacted_samples) audio_samples = compacted_samples;
+        audio_n_samples = compacted_n;
         if (qwen_verbose >= 1) {
             float used_pct = 100.0f * (float)audio_n_samples /
                              (float)(n_samples > 0 ? n_samples : 1);
             float skipped_pct = 100.0f - used_pct;
             if (skipped_pct < 0.0f) skipped_pct = 0.0f;
-            fprintf(stderr, "Silence skip: used %.1f%%, skipped %.1f%% (%d -> %d samples)\n",
-                    used_pct, skipped_pct, n_samples, audio_n_samples);
+            fprintf(stderr, "Silence skip: used %.1f%%, skipped %.1f%% (%d -> %lld samples)\n",
+                    used_pct, skipped_pct, n_samples, (long long)audio_n_samples);
         }
     }
 
-    /* For live mode, we maintain our own growing copy of the samples. */
+    /* For live mode, keep a local rolling buffer with global sample base. */
     float *local_samples = NULL;
-    int local_n_samples = 0;
-    int local_capacity = 0;
+    int64_t local_n_samples = 0;
+    int64_t local_capacity = 0;
+    int64_t local_base_sample = 0;
     int live_eof = 0;
 
     if (live) {
         /* Seed local buffer with whatever is available now. */
         pthread_mutex_lock(&live->mutex);
-        local_n_samples = live->n_samples;
+        int64_t live_start = live->sample_offset;
+        int64_t live_count = live->n_samples;
         live_eof = live->eof;
-        pthread_mutex_unlock(&live->mutex);
+        local_n_samples = live_count;
+        local_base_sample = live_start;
         if (local_n_samples > 0) {
             local_capacity = local_n_samples + chunk_samples * 4;
+            if ((uint64_t)local_capacity > (uint64_t)(SIZE_MAX / sizeof(float))) {
+                pthread_mutex_unlock(&live->mutex);
+                return NULL;
+            }
             local_samples = (float *)malloc((size_t)local_capacity * sizeof(float));
-            if (!local_samples) return NULL;
-            pthread_mutex_lock(&live->mutex);
-            if (live->n_samples < local_n_samples) local_n_samples = live->n_samples;
+            if (!local_samples) {
+                pthread_mutex_unlock(&live->mutex);
+                return NULL;
+            }
             memcpy(local_samples, live->samples, (size_t)local_n_samples * sizeof(float));
-            pthread_mutex_unlock(&live->mutex);
         }
+        /* Producer buffer is now mirrored locally: reset it to bound memory. */
+        live->sample_offset = live_start + live_count;
+        live->n_samples = 0;
+        pthread_mutex_unlock(&live->mutex);
         audio_samples = local_samples;
-        audio_n_samples = local_n_samples;
+        audio_n_samples = local_base_sample + local_n_samples;
+    } else {
+        if (audio_n_samples > INT_MAX) {
+            free(compacted_samples);
+            return NULL;
+        }
+        local_base_sample = 0;
+        local_n_samples = audio_n_samples;
     }
 
     ctx->perf_total_ms = 0;
@@ -1165,22 +1187,38 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
     if (no_cache_env && no_cache_env[0] != '\0' && strcmp(no_cache_env, "0") != 0) {
         use_enc_cache = 0;
     }
+    if (live && !use_enc_cache) {
+        if (qwen_verbose >= 1) {
+            fprintf(stderr, "Streaming (live): forcing encoder cache on (no-cache mode disabled)\n");
+        }
+        use_enc_cache = 1;
+    }
+
+    /* Sliding-window limits for long streams: bound encoder tokens and
+     * prefix tokens fed to the decoder so memory/compute stay flat.
+     * 4 windows × 8 s = 32 s of audio context; 150 prefix tokens ≈
+     * 140 text tokens of decoder context.  raw_tokens array itself
+     * grows unbounded (negligible memory) for correct text matching. */
+    #define QWEN_STREAM_MAX_ENC_WINDOWS  4
+    #define QWEN_STREAM_MAX_PREFIX_TOKENS 150
 
     if (qwen_verbose >= 2) {
         if (live)
             fprintf(stderr,
                     "Streaming (live): chunk=%.1f s, rollback=%d, "
-                    "unfixed=%d, max_new=%d, enc_window=%.1fs, enc_cache=%s, prefix=%s\n",
+                    "unfixed=%d, max_new=%d, enc_window=%.1fs, enc_cache=%s, prefix=%s, "
+                    "max_enc_win=%d, max_prefix=%d\n",
                     ctx->stream_chunk_sec, rollback,
                     unfixed_chunks, max_new_tokens,
                     (float)enc_window_frames / 100.0f,
                     use_enc_cache ? "on" : "off",
-                    ctx->past_text_conditioning ? "on" : "off");
+                    ctx->past_text_conditioning ? "on" : "off",
+                    QWEN_STREAM_MAX_ENC_WINDOWS, QWEN_STREAM_MAX_PREFIX_TOKENS);
         else
             fprintf(stderr,
-                    "Streaming: %d samples (%.1f s), chunk=%.1f s, rollback=%d, "
+                    "Streaming: %lld samples (%.1f s), chunk=%.1f s, rollback=%d, "
                     "unfixed=%d, max_new=%d, enc_window=%.1fs, enc_cache=%s, prefix=%s\n",
-                    audio_n_samples, (float)audio_n_samples / QWEN_SAMPLE_RATE,
+                    (long long)audio_n_samples, (float)audio_n_samples / QWEN_SAMPLE_RATE,
                     ctx->stream_chunk_sec, rollback,
                     unfixed_chunks, max_new_tokens,
                     (float)enc_window_frames / 100.0f,
@@ -1210,7 +1248,13 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
         if (qwen_verbose >= 2) {
             fprintf(stderr, "Streaming: no token callback, using direct final refinement\n");
         }
-        char *text = transcribe_segment(ctx, audio_samples, audio_n_samples, tokenizer, NULL, 0, NULL);
+        if (audio_n_samples > INT_MAX) {
+            qwen_tokenizer_free(tokenizer);
+            free(compacted_samples);
+            return NULL;
+        }
+        char *text = transcribe_segment(ctx, audio_samples, (int)audio_n_samples,
+                                        tokenizer, NULL, 0, NULL);
         qwen_tokenizer_free(tokenizer);
         free(compacted_samples);
         return text;
@@ -1252,11 +1296,13 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
     }
 
     int chunk_idx = 0;
-    int audio_cursor = 0;
+    int64_t audio_cursor = 0;
     stream_enc_window_t *enc_cache = NULL;
     int n_enc_cache = 0;
+    int enc_cache_start = 0;  /* first live entry (older ones evicted) */
     int enc_cache_cap = 0;
     int enc_cached_seq_total = 0;
+    int64_t next_window_start = 0;
     float *prev_prefill_embeds = NULL;
     int prev_prefill_len = 0;
     int prev_prefill_cap = 0;
@@ -1266,35 +1312,67 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
     while (audio_cursor < audio_n_samples || (live && !live_eof)) {
         /* Live mode: wait until we have enough data for the next chunk. */
         if (live) {
-            int want = audio_cursor + chunk_samples;
+            int64_t want = audio_cursor + chunk_samples;
             pthread_mutex_lock(&live->mutex);
-            while (live->n_samples < want && !live->eof)
+            while (live->sample_offset + live->n_samples < want && !live->eof)
                 pthread_cond_wait(&live->cond, &live->mutex);
-            int new_n = live->n_samples;
+
+            int64_t live_start = live->sample_offset;
+            int64_t live_count = live->n_samples;
+            int64_t live_end = live_start + live_count;
             int is_eof_now = live->eof;
-            /* Grow local buffer and copy delta. */
-            if (new_n > local_n_samples) {
-                if (new_n > local_capacity) {
-                    int new_cap = local_capacity > 0 ? local_capacity : 32000;
-                    while (new_cap < new_n) new_cap *= 2;
+
+            int64_t local_end = local_base_sample + local_n_samples;
+            if (local_end < live_start) {
+                if (qwen_verbose >= 1) {
+                    fprintf(stderr,
+                            "Streaming (live): local buffer overrun, resyncing "
+                            "(local_end=%lld, live_start=%lld)\n",
+                            (long long)local_end, (long long)live_start);
+                }
+                local_base_sample = live_start;
+                local_n_samples = 0;
+                local_end = local_base_sample;
+            }
+
+            if (live_end > local_end) {
+                int64_t delta64 = live_end - local_end;
+                int64_t src_off64 = local_end - live_start;
+                if (delta64 < 0 || src_off64 < 0 || src_off64 > live_count) {
+                    pthread_mutex_unlock(&live->mutex);
+                    break;
+                }
+
+                if (local_n_samples + delta64 > local_capacity) {
+                    int64_t new_cap = local_capacity > 0 ? local_capacity : 32000;
+                    while (new_cap < local_n_samples + delta64) new_cap *= 2;
+                    if ((uint64_t)new_cap > (uint64_t)(SIZE_MAX / sizeof(float))) {
+                        pthread_mutex_unlock(&live->mutex);
+                        break;
+                    }
                     float *tmp = (float *)realloc(local_samples,
                                                   (size_t)new_cap * sizeof(float));
-                    if (tmp) {
-                        local_samples = tmp;
-                        local_capacity = new_cap;
+                    if (!tmp) {
+                        pthread_mutex_unlock(&live->mutex);
+                        break;
                     }
+                    local_samples = tmp;
+                    local_capacity = new_cap;
                 }
-                if (local_capacity >= new_n) {
-                    memcpy(local_samples + local_n_samples,
-                           live->samples + local_n_samples,
-                           (size_t)(new_n - local_n_samples) * sizeof(float));
-                    local_n_samples = new_n;
-                }
+                memcpy(local_samples + (size_t)local_n_samples,
+                       live->samples + (size_t)src_off64,
+                       (size_t)delta64 * sizeof(float));
+                local_n_samples += delta64;
             }
+
+            /* Producer buffer is mirrored locally: reset it to bound memory. */
+            live->sample_offset = live_end;
+            live->n_samples = 0;
             live_eof = is_eof_now;
             pthread_mutex_unlock(&live->mutex);
+
             audio_samples = local_samples;
-            audio_n_samples = local_n_samples;
+            audio_n_samples = local_base_sample + local_n_samples;
             ctx->perf_audio_ms = 1000.0 * (double)audio_n_samples / (double)QWEN_SAMPLE_RATE;
         }
 
@@ -1312,10 +1390,15 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
         double t0 = get_time_ms();
         int enc_seq_len = 0;
         float *enc_output = NULL;
-        int full_end = (audio_cursor / enc_window_samples) * enc_window_samples;
+        int64_t full_end = (audio_cursor / enc_window_samples) * (int64_t)enc_window_samples;
 
         if (!use_enc_cache) {
-            if (stream_encode_span(ctx, audio_samples, audio_cursor,
+            if (audio_cursor > INT_MAX) {
+                ctx->perf_total_ms += get_time_ms() - chunk_t0;
+                chunk_idx++;
+                continue;
+            }
+            if (stream_encode_span(ctx, audio_samples, (int)audio_cursor,
                                    &enc_output, &enc_seq_len) != 0 ||
                 !enc_output || enc_seq_len <= 0) {
                 free(enc_output);
@@ -1335,11 +1418,19 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
         } else {
             int enc_failed = 0;
 
-            while (n_enc_cache * enc_window_samples < full_end) {
-                int ws = n_enc_cache * enc_window_samples;
+            while (next_window_start < full_end) {
+                int64_t ws = next_window_start;
+                int64_t ws_local_off = ws - local_base_sample;
+                if (ws_local_off < 0 ||
+                    ws_local_off + enc_window_samples > local_n_samples) {
+                    enc_failed = 1;
+                    break;
+                }
                 float *win_enc = NULL;
                 int win_seq = 0;
-                if (stream_encode_span(ctx, audio_samples + ws, enc_window_samples,
+                if (stream_encode_span(ctx,
+                                       audio_samples + (size_t)ws_local_off,
+                                       enc_window_samples,
                                        &win_enc, &win_seq) != 0 ||
                     !win_enc || win_seq <= 0) {
                     free(win_enc);
@@ -1366,13 +1457,20 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                 enc_cache[n_enc_cache].enc_output = win_enc;
                 n_enc_cache++;
                 enc_cached_seq_total += win_seq;
+                next_window_start += enc_window_samples;
             }
 
             float *partial_enc = NULL;
             int partial_seq = 0;
             if (!enc_failed && full_end < audio_cursor) {
-                int partial_samples = audio_cursor - full_end;
-                if (stream_encode_span(ctx, audio_samples + full_end, partial_samples,
+                int64_t partial_samples64 = audio_cursor - full_end;
+                int64_t partial_off64 = full_end - local_base_sample;
+                if (partial_samples64 > INT_MAX || partial_off64 < 0 ||
+                    partial_off64 + partial_samples64 > local_n_samples) {
+                    enc_failed = 1;
+                } else if (stream_encode_span(ctx,
+                                       audio_samples + (size_t)partial_off64,
+                                       (int)partial_samples64,
                                        &partial_enc, &partial_seq) != 0) {
                     free(partial_enc);
                     partial_enc = NULL;
@@ -1385,6 +1483,23 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                 ctx->perf_total_ms += get_time_ms() - chunk_t0;
                 chunk_idx++;
                 continue;
+            }
+
+            /* Evict old encoder windows beyond the sliding-window limit
+             * to keep decoder sequence length (and KV cache) bounded. */
+            {
+                int evicted = 0;
+                while (n_enc_cache - enc_cache_start > QWEN_STREAM_MAX_ENC_WINDOWS) {
+                    enc_cached_seq_total -= enc_cache[enc_cache_start].seq_len;
+                    free(enc_cache[enc_cache_start].enc_output);
+                    enc_cache[enc_cache_start].enc_output = NULL;
+                    enc_cache_start++;
+                    evicted++;
+                }
+                if (evicted && qwen_monitor) {
+                    fprintf(stderr, "\xe2\x9f\xb3");  /* ⟳ = window eviction */
+                    fflush(stderr);
+                }
             }
 
             enc_seq_len = enc_cached_seq_total + partial_seq;
@@ -1404,7 +1519,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
             }
 
             int enc_off = 0;
-            for (int i = 0; i < n_enc_cache; i++) {
+            for (int i = enc_cache_start; i < n_enc_cache; i++) {
                 memcpy(enc_output + (size_t)enc_off * dim,
                        enc_cache[i].enc_output,
                        (size_t)enc_cache[i].seq_len * dim * sizeof(float));
@@ -1423,7 +1538,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                         "  Encoder: %d tokens from 0.0-%.1f s (cached windows=%d, partial=%.1f s, %.0f ms)\n",
                         enc_seq_len,
                         (float)audio_cursor / QWEN_SAMPLE_RATE,
-                        n_enc_cache,
+                        n_enc_cache - enc_cache_start,
                         (float)(audio_cursor - full_end) / QWEN_SAMPLE_RATE,
                         enc_ms);
             }
@@ -1431,15 +1546,26 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                 double enc_ms = get_time_ms() - t0;
                 ctx->perf_encode_ms += enc_ms;
             }
+            if (qwen_monitor) {
+                fprintf(stderr, "\xe2\x96\xb6");  /* ▶ = encoder */
+                fflush(stderr);
+            }
         }
 
         /* Prefix rollback state:
          * we feed previously decoded raw tokens minus last `rollback` tokens.
          * This mirrors official streaming and keeps boundary text stable. */
+        int n_prefix_tokens_full = 0;
         int n_prefix_tokens = 0;
+        int prefix_offset = 0;
         if (ctx->past_text_conditioning && chunk_idx >= unfixed_chunks && n_raw_tokens > 0) {
-            n_prefix_tokens = n_raw_tokens - rollback;
-            if (n_prefix_tokens < 0) n_prefix_tokens = 0;
+            n_prefix_tokens_full = n_raw_tokens - rollback;
+            if (n_prefix_tokens_full < 0) n_prefix_tokens_full = 0;
+            n_prefix_tokens = n_prefix_tokens_full;
+            if (n_prefix_tokens > QWEN_STREAM_MAX_PREFIX_TOKENS) {
+                n_prefix_tokens = QWEN_STREAM_MAX_PREFIX_TOKENS;
+                prefix_offset = n_prefix_tokens_full - n_prefix_tokens;
+            }
         }
 
         /* ---- Build input embeddings ---- */
@@ -1496,7 +1622,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
         for (int i = 0; i < n_prefix_tokens; i++)
             tok_embed_bf16_to_f32(input_embeds + (text_off + i) * dim,
                                   ctx->decoder.tok_embeddings_bf16,
-                                  raw_tokens[i], dim);
+                                  raw_tokens[prefix_offset + i], dim);
 
         /* ---- Decoder prefill + first token ---- */
         t0 = get_time_ms();
@@ -1553,6 +1679,10 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
         if (qwen_verbose >= 2)
             fprintf(stderr, "  Prefill: %d tokens (%d prefix, reused %d) (%.0f ms)\n",
                     total_seq, n_prefix_tokens, reused_prefill, prefill_ms);
+        if (qwen_monitor) {
+            fprintf(stderr, "\xc2\xb7");  /* · = prefill */
+            fflush(stderr);
+        }
 
         /* ---- Autoregressive decode ---- */
         t0 = get_time_ms();
@@ -1567,11 +1697,86 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
         }
         int n_chunk_tokens = 0;
 
+        /* Live eager emit: emit text tokens via token_cb during decode
+         * instead of waiting for the post-decode commit phase.
+         * Uses text-level byte counting (not token counting) so that
+         * tokenization differences after EOS-reset don't cause word loss. */
+        int eager_active = 0;
+        int eager_saw_asr = 0;
+        int eager_prefix_text_bytes = 0;
+        int eager_gen_text_bytes = 0;
+        int eager_mismatch = 0;
+        size_t result_len_before_eager = result_len;
+
+        if (live && !live_eof && ctx->token_cb && chunk_idx >= unfixed_chunks) {
+            eager_active = 1;
+            /* Count text bytes from ALL prefix tokens (n_prefix_tokens_full),
+             * not just the capped subset fed to the decoder.  This ensures
+             * the eager emit frontier matches the full result position. */
+            if (ctx->n_force_prompt_tokens > 0) {
+                eager_saw_asr = 1;
+                for (int i = 0; i < n_prefix_tokens_full; i++) {
+                    const char *p = qwen_tokenizer_decode(tokenizer, raw_tokens[i]);
+                    eager_prefix_text_bytes += (int)strlen(p);
+                }
+            } else {
+                int saw = 0;
+                for (int i = 0; i < n_prefix_tokens_full; i++) {
+                    if (raw_tokens[i] == QWEN_TOKEN_ASR_TEXT) { saw = 1; continue; }
+                    if (saw) {
+                        const char *p = qwen_tokenizer_decode(tokenizer, raw_tokens[i]);
+                        eager_prefix_text_bytes += (int)strlen(p);
+                    }
+                }
+            }
+        }
+
         while (n_generated < max_new_tokens) {
             n_generated++;
             if (token == QWEN_TOKEN_ENDOFTEXT || token == QWEN_TOKEN_IM_END) break;
 
             chunk_tokens[n_chunk_tokens++] = token;
+
+            /* Eager emit: use text byte counting against result_len to
+             * determine when we've passed the committed frontier.
+             * Also appends emitted text to result so the commit phase
+             * sees it and doesn't re-emit. */
+            if (eager_active) {
+                if (!eager_saw_asr && token == QWEN_TOKEN_ASR_TEXT) {
+                    eager_saw_asr = 1;
+                } else if (eager_saw_asr && !eager_mismatch) {
+                    const char *piece = qwen_tokenizer_decode(tokenizer, token);
+                    int piece_len = (int)strlen(piece);
+                    int total_before = eager_prefix_text_bytes + eager_gen_text_bytes;
+                    eager_gen_text_bytes += piece_len;
+                    int total_after = total_before + piece_len;
+                    /* Verify overlap with committed result */
+                    if (total_before < (int)result_len_before_eager) {
+                        int check_end = total_after < (int)result_len_before_eager
+                                            ? total_after : (int)result_len_before_eager;
+                        if (memcmp(piece, result + total_before,
+                                   check_end - total_before) != 0)
+                            eager_mismatch = 1;
+                    }
+                    if (!eager_mismatch && total_after > (int)result_len_before_eager) {
+                        int skip = 0;
+                        if (total_before < (int)result_len_before_eager)
+                            skip = (int)result_len_before_eager - total_before;
+                        const char *emit_start = piece + skip;
+                        int emit_len = piece_len - skip;
+                        ctx->token_cb(emit_start, ctx->token_cb_userdata);
+                        /* Append to result so commit phase won't re-emit */
+                        if (result_len + (size_t)emit_len + 1 > result_cap) {
+                            while (result_len + (size_t)emit_len + 1 > result_cap)
+                                result_cap *= 2;
+                            result = (char *)realloc(result, result_cap);
+                        }
+                        memcpy(result + result_len, emit_start, (size_t)emit_len);
+                        result_len += (size_t)emit_len;
+                        result[result_len] = '\0';
+                    }
+                }
+            }
 
             tok_embed_bf16_to_f32(tmp_embed, ctx->decoder.tok_embeddings_bf16, token, dim);
             token = qwen_decoder_forward(ctx, tmp_embed);
@@ -1586,9 +1791,17 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                     (n_generated >= max_new_tokens &&
                      token != QWEN_TOKEN_ENDOFTEXT &&
                      token != QWEN_TOKEN_IM_END) ? ", hit max_new" : "");
+        if (qwen_monitor) {
+            /* ▪ = normal decode, ▸ = slow (>30ms/token) */
+            double ms_per_tok = n_generated > 0 ? decode_ms / n_generated : 0;
+            fprintf(stderr, "%s", ms_per_tok > 30 ? "\xe2\x96\xb8" : "\xe2\x96\xaa");
+            fflush(stderr);
+        }
 
-        /* Update raw token history = prefix + newly generated continuation. */
-        int n_raw_new = n_prefix_tokens + n_chunk_tokens;
+        /* Update raw token history = full prefix + newly generated continuation.
+         * Uses n_prefix_tokens_full (uncapped) so raw_tokens keeps the complete
+         * token sequence for correct text-level matching in the commit phase. */
+        int n_raw_new = n_prefix_tokens_full + n_chunk_tokens;
         if (n_raw_new > raw_tokens_cap) {
             while (n_raw_new > raw_tokens_cap) raw_tokens_cap *= 2;
             int *tmp_raw = (int *)realloc(raw_tokens, (size_t)raw_tokens_cap * sizeof(int));
@@ -1601,7 +1814,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
             raw_tokens = tmp_raw;
         }
         if (n_chunk_tokens > 0) {
-            memcpy(raw_tokens + n_prefix_tokens, chunk_tokens,
+            memcpy(raw_tokens + n_prefix_tokens_full, chunk_tokens,
                    (size_t)n_chunk_tokens * sizeof(int));
         }
         n_raw_tokens = n_raw_new;
@@ -1637,61 +1850,114 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
             if (candidate_len < 0) candidate_len = 0;
         }
 
-        /* Monotonic commit:
-         * We never retract already-emitted tokens in CLI mode. If a new chunk
-         * revises older text, we keep the committed prefix and only append
-         * additional confirmed suffix tokens. */
+        /* Text-level monotonic commit:
+         * Decode candidate tokens to text and compare byte-by-byte with
+         * the committed result.  Only emit/append text that extends past
+         * what's already in result.  This handles tokenization differences
+         * that arise after EOS-reset regenerations in live streaming. */
         int *candidate_tokens = raw_tokens + text_start;
-        int lcp = 0;
-        while (lcp < n_stable_text_tokens &&
-               lcp < candidate_len &&
-               stable_text_tokens[lcp] == candidate_tokens[lcp]) {
-            lcp++;
-        }
-        if (lcp < n_stable_text_tokens && qwen_verbose >= 2) {
-            fprintf(stderr,
-                    "  Commit: boundary revision before committed frontier "
-                    "(lcp=%d, committed=%d), keeping committed prefix\n",
-                    lcp, n_stable_text_tokens);
-        }
+        {
+            /* Build candidate text string, counting tokens past the
+             * pre-eager committed frontier for perf stats. */
+            size_t cand_cap = 256;
+            size_t cand_len = 0;
+            char *cand_text = (char *)malloc(cand_cap);
+            int new_token_count = 0;
 
-        int emit_from = n_stable_text_tokens;
-        int emit_to = candidate_len;
-        if (emit_to < emit_from) emit_to = emit_from;
+            if (cand_text) {
+                cand_text[0] = '\0';
+                for (int i = 0; i < candidate_len; i++) {
+                    const char *piece =
+                        qwen_tokenizer_decode(tokenizer, candidate_tokens[i]);
+                    size_t plen = strlen(piece);
+                    if (cand_len >= result_len_before_eager)
+                        new_token_count++;
+                    if (cand_len + plen + 1 > cand_cap) {
+                        while (cand_len + plen + 1 > cand_cap) cand_cap *= 2;
+                        cand_text = (char *)realloc(cand_text, cand_cap);
+                    }
+                    memcpy(cand_text + cand_len, piece, plen);
+                    cand_len += plen;
+                    cand_text[cand_len] = '\0';
+                }
 
-        if (emit_to > stable_text_cap) {
-            while (emit_to > stable_text_cap) stable_text_cap *= 2;
-            int *tmp_stable = (int *)realloc(stable_text_tokens,
-                                             (size_t)stable_text_cap * sizeof(int));
-            if (!tmp_stable) {
-                ctx->perf_total_ms += get_time_ms() - chunk_t0;
-                chunk_idx++;
-                continue;
+                /* Byte-level common prefix with committed result */
+                size_t common = 0;
+                size_t climit = result_len < cand_len ? result_len : cand_len;
+                while (common < climit && result[common] == cand_text[common])
+                    common++;
+
+                if (common < result_len_before_eager && qwen_verbose >= 2)
+                    fprintf(stderr,
+                            "  Commit: text divergence at byte %zu "
+                            "(committed=%zu), keeping committed prefix\n",
+                            common, result_len_before_eager);
+
+                /* Append text that extends past current result_len.
+                 * Eagerly emitted bytes are already in result, so
+                 * this only picks up text the commit adds beyond that. */
+                if (common >= result_len && cand_len > result_len) {
+                    const char *new_text = cand_text + result_len;
+                    size_t new_len = cand_len - result_len;
+
+                    if (ctx->token_cb)
+                        ctx->token_cb(new_text, ctx->token_cb_userdata);
+
+                    if (result_len + new_len + 1 > result_cap) {
+                        while (result_len + new_len + 1 > result_cap)
+                            result_cap *= 2;
+                        result = (char *)realloc(result, result_cap);
+                    }
+                    memcpy(result + result_len, new_text, new_len);
+                    result_len += new_len;
+                    result[result_len] = '\0';
+                }
+
+                ctx->perf_text_tokens += new_token_count;
+
+                /* Update stable_text_tokens for bookkeeping. */
+                if (candidate_len > stable_text_cap) {
+                    while (candidate_len > stable_text_cap) stable_text_cap *= 2;
+                    int *tmp_stable = (int *)realloc(stable_text_tokens,
+                                                     (size_t)stable_text_cap * sizeof(int));
+                    if (tmp_stable) stable_text_tokens = tmp_stable;
+                }
+                if (candidate_len <= stable_text_cap) {
+                    memcpy(stable_text_tokens, candidate_tokens,
+                           (size_t)candidate_len * sizeof(int));
+                    n_stable_text_tokens = candidate_len;
+                }
+
+                free(cand_text);
             }
-            stable_text_tokens = tmp_stable;
         }
-
-        for (int i = emit_from; i < emit_to; i++) {
-            stable_text_tokens[i] = candidate_tokens[i];
-            const char *piece = qwen_tokenizer_decode(tokenizer, candidate_tokens[i]);
-            if (ctx->token_cb)
-                ctx->token_cb(piece, ctx->token_cb_userdata);
-            ctx->perf_text_tokens++;
-
-            size_t piece_len = strlen(piece);
-            if (result_len + piece_len + 1 > result_cap) {
-                while (result_len + piece_len + 1 > result_cap) result_cap *= 2;
-                result = (char *)realloc(result, result_cap);
-            }
-            memcpy(result + result_len, piece, piece_len);
-            result_len += piece_len;
-            result[result_len] = '\0';
-        }
-        n_stable_text_tokens = emit_to;
 
         if (qwen_verbose >= 2) {
+            if (prefix_offset > 0)
+                fprintf(stderr, "  Prefix window: %d/%d tokens (offset %d)\n",
+                        n_prefix_tokens, n_prefix_tokens_full, prefix_offset);
             fprintf(stderr, "  Commit: candidate=%d tokens, emitted_total=%d\n",
                     candidate_len, n_stable_text_tokens);
+        }
+
+        if (live && use_enc_cache) {
+            /* Keep only the current partial tail [full_end, audio_n_samples). */
+            int64_t keep_from = full_end;
+            if (keep_from > local_base_sample) {
+                int64_t drop64 = keep_from - local_base_sample;
+                if (drop64 > local_n_samples) drop64 = local_n_samples;
+                if (drop64 > 0) {
+                    int64_t remain = local_n_samples - drop64;
+                    if (remain > 0) {
+                        memmove(local_samples, local_samples + (size_t)drop64,
+                                (size_t)remain * sizeof(float));
+                    }
+                    local_n_samples = remain;
+                    local_base_sample += drop64;
+                    audio_samples = local_samples;
+                    audio_n_samples = local_base_sample + local_n_samples;
+                }
+            }
         }
 
         ctx->perf_total_ms += get_time_ms() - chunk_t0;
@@ -1699,7 +1965,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
     }
 
     free(tmp_embed);
-    for (int i = 0; i < n_enc_cache; i++) {
+    for (int i = enc_cache_start; i < n_enc_cache; i++) {
         free(enc_cache[i].enc_output);
     }
     free(enc_cache);

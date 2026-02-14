@@ -39,7 +39,8 @@ ffmpeg -i audio.mp3 -f s16le -ar 16000 -ac 1 - 2>/dev/null | \
 - **Almost zero dependencies**: Pure C implementation. Only needs BLAS (Accelerate on macOS, OpenBLAS on Linux).
 - **Both models**: Automatically detects Qwen3-ASR-0.6B or 1.7B from the weight files.
 - **Streaming output**: Tokens are printed to stdout as they are generated, word by word, even in offline mode (no `--stream`).
-- **Streaming mode**: `--stream` processes audio in chunks with prefix rollback, bounding encoder cost for long files.
+- **Streaming mode**: `--stream` processes audio in chunks with prefix rollback. A sliding window bounds encoder and decoder context for indefinite streaming.
+- **Monitor mode**: `--monitor` shows inline Unicode symbols on stderr for real-time pipeline diagnostics.
 - **Language control**: `--language Italian` forces the target language (otherwise it is usually auto-detected).
 - **Prompt biasing**: `--prompt` injects a system prompt to bias the model toward specific terms or spellings. Note that prompt biasing is very soft. The models may or may not care about your instructions. Usually spelling instructions are followed decently.
 - **Optional silence skipping**: `--skip-silence` drops long silent spans before inference (off by default). It may use less CPU for the same file.
@@ -102,7 +103,12 @@ Streaming mode processes audio in **2-second chunks** with rollback text conditi
 4. Per chunk decode is bounded by `--stream-max-new-tokens` (default `32`).
 5. Only stable text is emitted; final chunk flushes remaining text.
 
-This keeps encoder recomputation under control, but decoder context size (memory and compute) still grows with total seen audio. For full-file transcription of prerecorded audio, offline segmented mode (for example `-S 20`) is usually much faster. Use `--stream` mainly for incremental/live output.
+This keeps encoder recomputation under control. For long streams, a **sliding window** automatically bounds both encoder and decoder context so that memory and compute stay flat indefinitely:
+
+- **Encoder window eviction**: only the most recent 4 encoder attention windows (~32 s of audio context) are kept; older windows are freed.
+- **Decoder prefix capping**: only the most recent ~150 tokens of previously decoded text are fed as decoder prefix context. The full token history is kept internally for correct text-level monotonic commit, but only the capped tail is embedded into the decoder input.
+
+These limits activate automatically when the stream is long enough to exceed them. For short files or live sessions under ~40 s, they have no effect.
 
 `--stream --silent` is a special non-interactive path: it skips chunk-by-chunk emission and runs a direct final refinement pass, so its timing is not representative of interactive streaming cost.
 
@@ -126,6 +132,29 @@ Streaming tuning:
 # allow more text generation per chunk
 ./qwen_asr -d qwen3-asr-0.6b -i audio.wav --stream --stream-max-new-tokens 64
 ```
+
+### Monitor Mode (`--monitor`)
+
+```bash
+./qwen_asr -d qwen3-asr-0.6b -i audio.wav --stream --monitor
+```
+
+Shows inline Unicode symbols on stderr alongside the transcription, useful for diagnosing streaming pipeline behavior in real time:
+
+| Symbol | Meaning |
+|--------|---------|
+| `▶` | Encoder chunk processed |
+| `·` | Decoder prefill completed |
+| `▪` | Decode step (normal speed) |
+| `▸` | Decode step (slow, >30 ms/token) |
+| `⟳` | Encoder window evicted (sliding window) |
+
+Example output (stderr + stdout interleaved):
+```
+▶·▪▶·▪▶·▪And so, my fellow Americans,▶·▪ ask not what your country...
+```
+
+Monitor output goes to stderr and does not affect the transcription text on stdout. It can be combined with `--debug` for full diagnostics, or used alone for a lightweight visual heartbeat.
 
 ### Segment Splitting (`-S`)
 
@@ -221,6 +250,16 @@ ffmpeg -i podcast.mp3 -f s16le -ar 16000 -ac 1 - 2>/dev/null | \
 
 # Pipe a WAV directly
 cat recording.wav | ./qwen_asr -d qwen3-asr-0.6b --stdin
+
+# Live transcription of a web radio stream
+curl -sL http://stream.live.vc.bbcmedia.co.uk/bbc_world_service | \
+    ffmpeg -i pipe:0 -ar 16000 -ac 1 -f s16le pipe:1 2>/dev/null | \
+    ./qwen_asr -d qwen3-asr-0.6b --stdin --stream --monitor
+
+# Same flow, but keep WAV framing on stdin
+curl -sL http://stream.live.vc.bbcmedia.co.uk/bbc_world_service | \
+    ffmpeg -i pipe:0 -ar 16000 -ac 1 -f wav pipe:1 2>/dev/null | \
+    ./qwen_asr -d qwen3-asr-0.6b --stdin --stream --monitor
 ```
 
 To convert files to WAV format, just use ffmpeg:
