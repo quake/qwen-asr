@@ -1308,11 +1308,12 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
 
     /* Sliding-window limits for long streams: bound encoder tokens and
      * prefix tokens fed to the decoder so memory/compute stay flat.
-     * 4 windows × 8 s = 32 s of audio context; 150 prefix tokens ≈
-     * 140 text tokens of decoder context.  raw_tokens array itself
-     * grows unbounded (negligible memory) for correct text matching. */
-    #define QWEN_STREAM_MAX_ENC_WINDOWS  4
-    #define QWEN_STREAM_MAX_PREFIX_TOKENS 150
+     * 2 windows × 8 s = 16 s of audio context; 75 prefix tokens ≈
+     * 70 text tokens of decoder context.  raw_tokens array itself
+     * grows unbounded (negligible memory) for correct text matching.
+     * NOTE: Reduced from 4/150 to 2/75 for better real-time performance. */
+    #define QWEN_STREAM_MAX_ENC_WINDOWS  2
+    #define QWEN_STREAM_MAX_PREFIX_TOKENS 75
     #define QWEN_STREAM_MAX_REPEAT_TOKEN_RUN 12
     #define QWEN_STREAM_OVERLAP_MAX_TOKENS 48
     #define QWEN_STREAM_OVERLAP_MIN_TOKENS 4
