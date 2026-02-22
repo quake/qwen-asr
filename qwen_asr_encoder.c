@@ -261,11 +261,17 @@ float *qwen_encoder_forward(qwen_ctx_t *ctx, const float *mel, int mel_frames,
         /* Reshape [480, 16, w3] -> [w3, 480*16=7680] then project to d_model */
         int conv_proj_dim = QWEN_CONV_HIDDEN * h3; /* 480 * 16 = 7680 */
         float *reshaped = (float *)malloc(w3 * conv_proj_dim * sizeof(float));
-        for (int t = 0; t < w3; t++) {
-            for (int ch = 0; ch < QWEN_CONV_HIDDEN; ch++) {
-                for (int f = 0; f < h3; f++) {
-                    reshaped[t * conv_proj_dim + ch * h3 + f] =
-                        c3[ch * h3 * w3 + f * w3 + t];
+        /*
+         * Reorder loops for cache-friendly c3 reads.
+         * c3 layout: [ch, f, t] with strides [h3*w3, w3, 1]
+         * Iterating ch -> f -> t makes reads sequential.
+         */
+        for (int ch = 0; ch < QWEN_CONV_HIDDEN; ch++) {
+            for (int f = 0; f < h3; f++) {
+                const float *src_row = c3 + ch * h3 * w3 + f * w3;
+                int dst_offset = ch * h3 + f;
+                for (int t = 0; t < w3; t++) {
+                    reshaped[t * conv_proj_dim + dst_offset] = src_row[t];
                 }
             }
         }

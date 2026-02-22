@@ -13,6 +13,9 @@
 #if (defined(__AVX512F__) || defined(__AVX2__)) && (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
 #include <immintrin.h>
 #endif
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 #ifdef __APPLE__
 #include <sys/sysctl.h>
 #else
@@ -157,15 +160,93 @@ static void parallel_for(parallel_fn_t fn, void *arg) {
  * ======================================================================== */
 
 void qwen_add_inplace(float *a, const float *b, int n) {
+#if defined(__AVX512F__)
+    int i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m512 va = _mm512_loadu_ps(a + i);
+        __m512 vb = _mm512_loadu_ps(b + i);
+        _mm512_storeu_ps(a + i, _mm512_add_ps(va, vb));
+    }
+    for (; i < n; i++) a[i] += b[i];
+#elif defined(__AVX2__)
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 va = _mm256_loadu_ps(a + i);
+        __m256 vb = _mm256_loadu_ps(b + i);
+        _mm256_storeu_ps(a + i, _mm256_add_ps(va, vb));
+    }
+    for (; i < n; i++) a[i] += b[i];
+#elif defined(__ARM_NEON)
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t va = vld1q_f32(a + i);
+        float32x4_t vb = vld1q_f32(b + i);
+        vst1q_f32(a + i, vaddq_f32(va, vb));
+    }
+    for (; i < n; i++) a[i] += b[i];
+#else
     for (int i = 0; i < n; i++) a[i] += b[i];
+#endif
 }
 
 void qwen_mul_inplace(float *a, const float *b, int n) {
+#if defined(__AVX512F__)
+    int i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m512 va = _mm512_loadu_ps(a + i);
+        __m512 vb = _mm512_loadu_ps(b + i);
+        _mm512_storeu_ps(a + i, _mm512_mul_ps(va, vb));
+    }
+    for (; i < n; i++) a[i] *= b[i];
+#elif defined(__AVX2__)
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 va = _mm256_loadu_ps(a + i);
+        __m256 vb = _mm256_loadu_ps(b + i);
+        _mm256_storeu_ps(a + i, _mm256_mul_ps(va, vb));
+    }
+    for (; i < n; i++) a[i] *= b[i];
+#elif defined(__ARM_NEON)
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t va = vld1q_f32(a + i);
+        float32x4_t vb = vld1q_f32(b + i);
+        vst1q_f32(a + i, vmulq_f32(va, vb));
+    }
+    for (; i < n; i++) a[i] *= b[i];
+#else
     for (int i = 0; i < n; i++) a[i] *= b[i];
+#endif
 }
 
 void qwen_scale(float *x, float s, int n) {
+#if defined(__AVX512F__)
+    int i = 0;
+    __m512 vs = _mm512_set1_ps(s);
+    for (; i + 16 <= n; i += 16) {
+        __m512 vx = _mm512_loadu_ps(x + i);
+        _mm512_storeu_ps(x + i, _mm512_mul_ps(vx, vs));
+    }
+    for (; i < n; i++) x[i] *= s;
+#elif defined(__AVX2__)
+    int i = 0;
+    __m256 vs = _mm256_set1_ps(s);
+    for (; i + 8 <= n; i += 8) {
+        __m256 vx = _mm256_loadu_ps(x + i);
+        _mm256_storeu_ps(x + i, _mm256_mul_ps(vx, vs));
+    }
+    for (; i < n; i++) x[i] *= s;
+#elif defined(__ARM_NEON)
+    int i = 0;
+    float32x4_t vs = vdupq_n_f32(s);
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t vx = vld1q_f32(x + i);
+        vst1q_f32(x + i, vmulq_f32(vx, vs));
+    }
+    for (; i < n; i++) x[i] *= s;
+#else
     for (int i = 0; i < n; i++) x[i] *= s;
+#endif
 }
 
 void qwen_copy(float *dst, const float *src, int n) {
@@ -230,9 +311,33 @@ void qwen_linear_nobias(float *y, const float *x, const float *W,
 
 /* Convert bf16 buffer to f32 buffer */
 static void bf16_to_f32_buf(float *dst, const uint16_t *src, size_t n) {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    size_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m256i raw = _mm256_loadu_si256((const __m256i *)(src + i));
+        __m512i wide = _mm512_cvtepu16_epi32(raw);
+        __m512i shifted = _mm512_slli_epi32(wide, 16);
+        _mm512_storeu_ps(dst + i, _mm512_castsi512_ps(shifted));
+    }
+    uint32_t *d = (uint32_t *)(void *)dst;
+    for (; i < n; i++)
+        d[i] = ((uint32_t)src[i]) << 16;
+#elif defined(__AVX2__)
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m128i raw = _mm_loadu_si128((const __m128i *)(src + i));
+        __m256i wide = _mm256_cvtepu16_epi32(raw);
+        __m256i shifted = _mm256_slli_epi32(wide, 16);
+        _mm256_storeu_ps(dst + i, _mm256_castsi256_ps(shifted));
+    }
+    uint32_t *d = (uint32_t *)(void *)dst;
+    for (; i < n; i++)
+        d[i] = ((uint32_t)src[i]) << 16;
+#else
     uint32_t *d = (uint32_t *)(void *)dst;
     for (size_t i = 0; i < n; i++)
         d[i] = ((uint32_t)src[i]) << 16;
+#endif
 }
 
 /* Reusable scratch buffer for bf16->f32 conversion */
@@ -884,6 +989,13 @@ void qwen_silu(float *x, int n) {
 }
 
 void qwen_gelu(float *x, int n) {
+    /*
+     * GELU(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+     *
+     * Note: Fast tanh approximations (rational or polynomial) do not provide
+     * sufficient accuracy for neural network inference. Using standard tanhf()
+     * to ensure correct transcription quality.
+     */
     for (int i = 0; i < n; i++) {
         float val = x[i];
         float x3 = val * val * val;
@@ -1000,13 +1112,13 @@ static inline void qwen_vec_scale_add(float *dst, const float *src, float correc
     qwen_vec_scale_add_impl(dst, src, correction, n);
 }
 
-void qwen_bidirectional_attention(float *out, const float *Q, const float *K,
-                                   const float *V, int seq __attribute__((unused)),
-                                   int n_heads, int head_dim, float scale,
-                                   const int *window_starts, int n_windows) {
+static void qwen_bidirectional_attention_heads(float *out, const float *Q, const float *K,
+                                                const float *V, int n_heads, int head_dim,
+                                                float scale, const int *window_starts,
+                                                int n_windows, int head_start, int head_end) {
     int hidden = n_heads * head_dim;
 
-    for (int h = 0; h < n_heads; h++) {
+    for (int h = head_start; h < head_end; h++) {
         for (int w = 0; w < n_windows; w++) {
             int ws = window_starts[w];
             int we = window_starts[w + 1];
@@ -1045,6 +1157,49 @@ void qwen_bidirectional_attention(float *out, const float *Q, const float *K,
             }
         }
     }
+}
+
+typedef struct {
+    float *out;
+    const float *Q;
+    const float *K;
+    const float *V;
+    int n_heads;
+    int head_dim;
+    float scale;
+    const int *window_starts;
+    int n_windows;
+} bidir_attn_task_t;
+
+static void bidir_attn_worker(int tid, int n_threads, void *arg) {
+    bidir_attn_task_t *t = (bidir_attn_task_t *)arg;
+    int chunk = (t->n_heads + n_threads - 1) / n_threads;
+    int h0 = tid * chunk;
+    int h1 = h0 + chunk;
+    if (h1 > t->n_heads) h1 = t->n_heads;
+    if (h0 >= h1) return;
+
+    qwen_bidirectional_attention_heads(t->out, t->Q, t->K, t->V,
+                                        t->n_heads, t->head_dim, t->scale,
+                                        t->window_starts, t->n_windows, h0, h1);
+}
+
+void qwen_bidirectional_attention(float *out, const float *Q, const float *K,
+                                   const float *V, int seq __attribute__((unused)),
+                                   int n_heads, int head_dim, float scale,
+                                   const int *window_starts, int n_windows) {
+    if (tp.n_threads > 1 && n_heads >= 2) {
+        bidir_attn_task_t task = {
+            .out = out, .Q = Q, .K = K, .V = V,
+            .n_heads = n_heads, .head_dim = head_dim,
+            .scale = scale, .window_starts = window_starts, .n_windows = n_windows
+        };
+        parallel_for(bidir_attn_worker, &task);
+        return;
+    }
+
+    qwen_bidirectional_attention_heads(out, Q, K, V, n_heads, head_dim, scale,
+                                        window_starts, n_windows, 0, n_heads);
 }
 
 static void qwen_causal_attention_heads(float *out, const float *Q, const float *K,

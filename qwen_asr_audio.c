@@ -19,6 +19,10 @@
 #include <math.h>
 #include <limits.h>
 
+#if defined(USE_BLAS) && defined(__APPLE__)
+#include <Accelerate/Accelerate.h>
+#endif
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -344,9 +348,23 @@ float *qwen_mel_spectrogram(const float *samples, int n_samples, int *out_frames
 
     for (int t = 0; t < n_frames; t++) {
         int start = t * HOP_LENGTH;
+#if defined(USE_BLAS) && defined(__APPLE__)
+        /* Use vDSP for windowing: windowed = padded[start:] * window */
+        vDSP_vmul(padded + start, 1, window, 1, windowed, 1, N_FFT);
+#else
         for (int i = 0; i < N_FFT; i++)
             windowed[i] = padded[start + i] * window[i];
+#endif
 
+#if defined(USE_BLAS) && defined(__APPLE__)
+        /* Use vDSP for DFT dot products */
+        for (int k = 0; k < n_freqs; k++) {
+            float re, im;
+            vDSP_dotpr(windowed, 1, dft_cos + k * N_FFT, 1, &re, N_FFT);
+            vDSP_dotpr(windowed, 1, dft_sin + k * N_FFT, 1, &im, N_FFT);
+            power[k] = re * re + im * im;
+        }
+#else
         for (int k = 0; k < n_freqs; k++) {
             float re = 0, im = 0;
             const float *cos_row = dft_cos + k * N_FFT;
@@ -357,7 +375,19 @@ float *qwen_mel_spectrogram(const float *samples, int n_samples, int *out_frames
             }
             power[k] = re * re + im * im;
         }
+#endif
 
+#if defined(USE_BLAS) && defined(__APPLE__)
+        /* Use vDSP for mel filter dot products */
+        for (int m = 0; m < N_MEL; m++) {
+            float sum;
+            vDSP_dotpr(power, 1, mel_filters + (size_t)m * n_freqs, 1, &sum, n_freqs);
+            if (sum < 1e-10f) sum = 1e-10f;
+            float val = log10f(sum);
+            mel_tmp[t * N_MEL + m] = val;
+            if (val > global_max) global_max = val;
+        }
+#else
         for (int m = 0; m < N_MEL; m++) {
             float sum = 0.0f;
             const float *filt = mel_filters + (size_t)m * n_freqs;
@@ -367,6 +397,7 @@ float *qwen_mel_spectrogram(const float *samples, int n_samples, int *out_frames
             mel_tmp[t * N_MEL + m] = val;
             if (val > global_max) global_max = val;
         }
+#endif
     }
 
     /* Second pass: clamp with dynamic max and normalize.
