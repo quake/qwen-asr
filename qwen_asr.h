@@ -280,6 +280,12 @@ int qwen_set_prompt(qwen_ctx_t *ctx, const char *prompt);
  * Returns 0 on success, -1 if language is unsupported. */
 int qwen_set_force_language(qwen_ctx_t *ctx, const char *language);
 
+/* Enable/disable past text conditioning for streaming mode.
+ * When enabled (1), decoded text is used as prefix context for subsequent chunks.
+ * This improves coherence but may cause repetition if reset logic is triggered.
+ * Default: 0 (off). Recommended: 1 for --stream mode. */
+void qwen_set_past_text_conditioning(qwen_ctx_t *ctx, int enable);
+
 /* Comma-separated supported language names for --language. */
 const char *qwen_supported_languages_csv(void);
 

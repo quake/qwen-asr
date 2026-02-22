@@ -118,6 +118,10 @@ int qwen_set_force_language(qwen_ctx_t *ctx, const char *language) {
     return 0;
 }
 
+void qwen_set_past_text_conditioning(qwen_ctx_t *ctx, int enable) {
+    if (ctx) ctx->past_text_conditioning = enable ? 1 : 0;
+}
+
 /* ========================================================================
  * Internal load functions (defined in encoder/decoder .c files)
  * ======================================================================== */
