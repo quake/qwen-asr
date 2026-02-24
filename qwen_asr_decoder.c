@@ -301,7 +301,13 @@ void qwen_decoder_prefill(qwen_ctx_t *ctx, const float *input_embeds, int seq_le
 
     float scale = 1.0f / sqrtf((float)head_dim);
 
-    for (int layer = 0; layer < cfg->dec_layers; layer++) {
+    /* Effective layer count: use limit if set, otherwise all layers */
+    int n_layers = cfg->dec_layers;
+    if (ctx->dec_layers_limit > 0 && ctx->dec_layers_limit < n_layers) {
+        n_layers = ctx->dec_layers_limit;
+    }
+
+    for (int layer = 0; layer < n_layers; layer++) {
         qwen_dec_layer_t *l = &dec->layers[layer];
 
         /* Input RMSNorm */
@@ -425,7 +431,13 @@ int qwen_decoder_forward(qwen_ctx_t *ctx, const float *input_embed) {
 
     float scale = 1.0f / sqrtf((float)head_dim);
 
-    for (int layer = 0; layer < cfg->dec_layers; layer++) {
+    /* Effective layer count: use limit if set, otherwise all layers */
+    int n_layers = cfg->dec_layers;
+    if (ctx->dec_layers_limit > 0 && ctx->dec_layers_limit < n_layers) {
+        n_layers = ctx->dec_layers_limit;
+    }
+
+    for (int layer = 0; layer < n_layers; layer++) {
         qwen_dec_layer_t *l = &dec->layers[layer];
 
         qwen_rms_norm(x_norm, x, l->input_norm, 1, dim, eps);

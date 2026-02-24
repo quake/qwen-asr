@@ -122,6 +122,19 @@ void qwen_set_past_text_conditioning(qwen_ctx_t *ctx, int enable) {
     if (ctx) ctx->past_text_conditioning = enable ? 1 : 0;
 }
 
+void qwen_set_stream_chunk_sec(qwen_ctx_t *ctx, float chunk_sec) {
+    if (ctx && chunk_sec > 0.1f && chunk_sec <= 10.0f) {
+        ctx->stream_chunk_sec = chunk_sec;
+    }
+}
+
+void qwen_set_dec_layers_limit(qwen_ctx_t *ctx, int n_layers) {
+    if (ctx) {
+        /* 0 means use all layers, >0 means limit to first N */
+        ctx->dec_layers_limit = (n_layers >= 0) ? n_layers : 0;
+    }
+}
+
 /* ========================================================================
  * Internal load functions (defined in encoder/decoder .c files)
  * ======================================================================== */
@@ -245,6 +258,7 @@ qwen_ctx_t *qwen_load(const char *model_dir) {
     ctx->stream_max_new_tokens = 32;
     ctx->past_text_conditioning = 0;
     ctx->skip_silence = 0;
+    ctx->dec_layers_limit = 0;  /* 0 = use all layers */
 
     if (qwen_verbose >= 1) fprintf(stderr, "Model loaded.\n");
     return ctx;

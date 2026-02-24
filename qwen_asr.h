@@ -224,6 +224,7 @@ typedef struct {
     int past_text_conditioning;    /* 1=enable past text conditioning in -S/--stream (default: off).
                                     * In segmented mode, this also enables boundary cleanup/post-processing. */
     int skip_silence;              /* 1=drop long silent spans before transcription */
+    int dec_layers_limit;          /* 0=use all layers, >0=use only first N layers (experimental) */
 
     /* Optional prompt/language controls */
     char *prompt;                  /* system prompt text (UTF-8) */
@@ -285,6 +286,16 @@ int qwen_set_force_language(qwen_ctx_t *ctx, const char *language);
  * This improves coherence but may cause repetition if reset logic is triggered.
  * Default: 0 (off). Recommended: 1 for --stream mode. */
 void qwen_set_past_text_conditioning(qwen_ctx_t *ctx, int enable);
+
+/* Set streaming chunk size in seconds.
+ * Smaller chunks (e.g., 1.0) reduce latency but increase overhead.
+ * Valid range: 0.1 to 10.0 seconds. Default: 2.0. */
+void qwen_set_stream_chunk_sec(qwen_ctx_t *ctx, float chunk_sec);
+
+/* Set decoder layer limit for early exit (experimental).
+ * 0 = use all layers (default), >0 = use only first N layers.
+ * Reduces compute time but may impact transcription quality. */
+void qwen_set_dec_layers_limit(qwen_ctx_t *ctx, int n_layers);
 
 /* Comma-separated supported language names for --language. */
 const char *qwen_supported_languages_csv(void);
