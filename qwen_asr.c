@@ -239,7 +239,7 @@ qwen_ctx_t *qwen_load(const char *model_dir) {
     ctx->search_sec = 3.0f;
 
     /* Default streaming parameters */
-    ctx->stream_chunk_sec = 2.0f;
+    ctx->stream_chunk_sec = 2.0f;  /* Default chunk size */
     ctx->stream_rollback = 5;
     ctx->stream_unfixed_chunks = 2;
     ctx->stream_max_new_tokens = 32;
@@ -1311,9 +1311,9 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
      * 2 windows × 8 s = 16 s of audio context; 75 prefix tokens ≈
      * 70 text tokens of decoder context.  raw_tokens array itself
      * grows unbounded (negligible memory) for correct text matching.
-     * NOTE: Reduced from 4/150 to 2/75 for better real-time performance. */
-    #define QWEN_STREAM_MAX_ENC_WINDOWS  2
-    #define QWEN_STREAM_MAX_PREFIX_TOKENS 75
+     * NOTE: Reduced from 4/150 to 2/75, then to 1/50 for better real-time performance. */
+    #define QWEN_STREAM_MAX_ENC_WINDOWS  1
+    #define QWEN_STREAM_MAX_PREFIX_TOKENS 50
     #define QWEN_STREAM_MAX_REPEAT_TOKEN_RUN 12
     #define QWEN_STREAM_OVERLAP_MAX_TOKENS 48
     #define QWEN_STREAM_OVERLAP_MIN_TOKENS 4
