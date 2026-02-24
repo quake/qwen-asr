@@ -18,6 +18,8 @@
 #endif
 #ifdef __APPLE__
 #include <sys/sysctl.h>
+#elif defined(_WIN32) || defined(_WIN64)
+#include <windows.h>
 #else
 #include <unistd.h>
 #endif
@@ -126,6 +128,10 @@ int qwen_get_num_cpus(void) {
     size_t len = sizeof(n);
     sysctlbyname("hw.ncpu", &n, &len, NULL, 0);
     return n > 0 ? n : 1;
+#elif defined(_WIN32) || defined(_WIN64)
+    SYSTEM_INFO sysinfo;
+    GetSystemInfo(&sysinfo);
+    return sysinfo.dwNumberOfProcessors > 0 ? sysinfo.dwNumberOfProcessors : 1;
 #else
     int n = (int)sysconf(_SC_NPROCESSORS_ONLN);
     return n > 0 ? n : 1;
