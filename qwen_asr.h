@@ -292,6 +292,13 @@ void qwen_set_past_text_conditioning(qwen_ctx_t *ctx, int enable);
  * Valid range: 0.1 to 10.0 seconds. Default: 2.0. */
 void qwen_set_stream_chunk_sec(qwen_ctx_t *ctx, float chunk_sec);
 
+/* Set offline segmentation size in seconds.
+ * 0 disables segmentation (full-audio decode). */
+void qwen_set_segment_sec(qwen_ctx_t *ctx, float segment_sec);
+
+/* Set offline segment boundary search window in seconds (default 3.0). */
+void qwen_set_search_sec(qwen_ctx_t *ctx, float search_sec);
+
 /* Set decoder layer limit for early exit (experimental).
  * 0 = use all layers (default), >0 = use only first N layers.
  * Reduces compute time but may impact transcription quality. */

@@ -128,6 +128,18 @@ void qwen_set_stream_chunk_sec(qwen_ctx_t *ctx, float chunk_sec) {
     }
 }
 
+void qwen_set_segment_sec(qwen_ctx_t *ctx, float segment_sec) {
+    if (!ctx) return;
+    ctx->segment_sec = (segment_sec >= 0.0f) ? segment_sec : 0.0f;
+}
+
+void qwen_set_search_sec(qwen_ctx_t *ctx, float search_sec) {
+    if (!ctx) return;
+    if (search_sec > 0.0f) {
+        ctx->search_sec = search_sec;
+    }
+}
+
 void qwen_set_dec_layers_limit(qwen_ctx_t *ctx, int n_layers) {
     if (ctx) {
         /* 0 means use all layers, >0 means limit to first N */
