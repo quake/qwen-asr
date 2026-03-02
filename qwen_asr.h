@@ -224,6 +224,7 @@ typedef struct {
     int past_text_conditioning;    /* 1=enable past text conditioning in -S/--stream (default: off).
                                     * In segmented mode, this also enables boundary cleanup/post-processing. */
     int skip_silence;              /* 1=drop long silent spans before transcription */
+    int dec_layers_limit;          /* 0=use all layers, >0=limit decoder to N layers */
 
     /* Optional prompt/language controls */
     char *prompt;                  /* system prompt text (UTF-8) */
@@ -301,6 +302,24 @@ char *qwen_transcribe_stream(qwen_ctx_t *ctx, const float *samples, int n_sample
  * The streaming loop waits for new data instead of terminating at EOF.
  * Tokens are emitted via the token callback as they become "fixed". */
 char *qwen_transcribe_stream_live(qwen_ctx_t *ctx, qwen_live_audio_t *live);
+
+/* Set past text conditioning (0=off, 1=on) */
+void qwen_set_past_text_conditioning(qwen_ctx_t *ctx, int enable);
+
+/* Set streaming chunk interval in seconds */
+void qwen_set_stream_chunk_sec(qwen_ctx_t *ctx, float sec);
+
+/* Set segmentation window in seconds (0=no splitting) */
+void qwen_set_segment_sec(qwen_ctx_t *ctx, float sec);
+
+/* Set silence search window in seconds for segment cutting */
+void qwen_set_search_sec(qwen_ctx_t *ctx, float sec);
+
+/* Limit decoder to N layers (0=use all layers) */
+void qwen_set_dec_layers_limit(qwen_ctx_t *ctx, int n);
+
+/* Reset KV cache (clear cached state) */
+void qwen_reset_kv_cache(qwen_ctx_t *ctx);
 
 /* ========================================================================
  * Internal Functions

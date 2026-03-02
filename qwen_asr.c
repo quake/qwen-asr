@@ -16,7 +16,11 @@
 #include <ctype.h>
 #include <math.h>
 #include <limits.h>
+#if defined(_WIN32) || defined(_WIN64)
+#include <windows.h>
+#else
 #include <sys/time.h>
+#endif
 
 /* Global verbose flag */
 int qwen_verbose = 0;
@@ -116,6 +120,38 @@ int qwen_set_force_language(qwen_ctx_t *ctx, const char *language) {
     ctx->force_language = dup;
     reset_prompt_cache(ctx);
     return 0;
+}
+
+void qwen_set_past_text_conditioning(qwen_ctx_t *ctx, int enable) {
+    if (ctx) ctx->past_text_conditioning = enable ? 1 : 0;
+}
+
+void qwen_set_stream_chunk_sec(qwen_ctx_t *ctx, float chunk_sec) {
+    if (ctx && chunk_sec > 0.1f && chunk_sec <= 10.0f) {
+        ctx->stream_chunk_sec = chunk_sec;
+    }
+}
+
+void qwen_set_segment_sec(qwen_ctx_t *ctx, float segment_sec) {
+    if (!ctx) return;
+    ctx->segment_sec = (segment_sec >= 0.0f) ? segment_sec : 0.0f;
+}
+
+void qwen_set_search_sec(qwen_ctx_t *ctx, float search_sec) {
+    if (!ctx) return;
+    if (search_sec > 0.0f) {
+        ctx->search_sec = search_sec;
+    }
+}
+
+void qwen_set_dec_layers_limit(qwen_ctx_t *ctx, int n_layers) {
+    if (ctx) {
+        ctx->dec_layers_limit = (n_layers >= 0) ? n_layers : 0;
+    }
+}
+
+void qwen_reset_kv_cache(qwen_ctx_t *ctx) {
+    if (ctx) ctx->kv_cache_len = 0;
 }
 
 /* ========================================================================
@@ -360,9 +396,16 @@ static void tok_embed_bf16_to_f32(float *dst, const uint16_t *tok_emb_bf16,
 }
 
 static double get_time_ms(void) {
+#if defined(_WIN32) || defined(_WIN64)
+    LARGE_INTEGER freq, count;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&count);
+    return (double)count.QuadPart / (double)freq.QuadPart * 1000.0;
+#else
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+#endif
 }
 
 static int cmp_float_asc(const void *a, const void *b) {
