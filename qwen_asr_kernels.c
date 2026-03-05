@@ -199,8 +199,112 @@ void qwen_matmul_t(float *C, const float *A, const float *B, int M, int K, int N
 #endif
 }
 
+/* ---- Custom threaded f32 GEMM using AVX-512 FMA ---- */
+#if defined(__AVX512F__) && (defined(__x86_64__) || defined(_M_X64))
+
+typedef struct {
+    float *y;
+    const float *x;
+    const float *W;      /* [out_dim, in_dim] row-major */
+    int seq_len;
+    int in_dim;
+    int out_dim;
+} f32_gemm_task_t;
+
+static void f32_gemm_worker(int tid, int n_threads, void *arg) {
+    f32_gemm_task_t *t = (f32_gemm_task_t *)arg;
+    const int seq_len = t->seq_len;
+    const int in_dim = t->in_dim;
+    const int out_dim = t->out_dim;
+    const float *x = t->x;
+    const float *W = t->W;
+    float *y = t->y;
+
+    int chunk = (out_dim + n_threads - 1) / n_threads;
+    int o_start = tid * chunk;
+    int o_end = o_start + chunk;
+    if (o_end > out_dim) o_end = out_dim;
+
+    for (int s = 0; s < seq_len; s++) {
+        const float *xrow = x + (size_t)s * in_dim;
+        float *yrow = y + (size_t)s * out_dim;
+
+        int o = o_start;
+        /* Process 2 output rows at a time to amortize x loads */
+        for (; o + 1 < o_end; o += 2) {
+            const float *w0 = W + (size_t)o * in_dim;
+            const float *w1 = w0 + in_dim;
+
+            __m512 acc0 = _mm512_setzero_ps();
+            __m512 acc1 = _mm512_setzero_ps();
+
+            int k = 0;
+            for (; k + 16 <= in_dim; k += 16) {
+                __m512 xv = _mm512_loadu_ps(xrow + k);
+                acc0 = _mm512_fmadd_ps(xv, _mm512_loadu_ps(w0 + k), acc0);
+                acc1 = _mm512_fmadd_ps(xv, _mm512_loadu_ps(w1 + k), acc1);
+            }
+            if (k < in_dim) {
+                int rem = in_dim - k;
+                __mmask16 mask = (__mmask16)((1U << rem) - 1);
+                __m512 xv = _mm512_maskz_loadu_ps(mask, xrow + k);
+                acc0 = _mm512_fmadd_ps(xv, _mm512_maskz_loadu_ps(mask, w0 + k), acc0);
+                acc1 = _mm512_fmadd_ps(xv, _mm512_maskz_loadu_ps(mask, w1 + k), acc1);
+            }
+
+            yrow[o]     = _mm512_reduce_add_ps(acc0);
+            yrow[o + 1] = _mm512_reduce_add_ps(acc1);
+        }
+        /* Handle last odd output row */
+        if (o < o_end) {
+            const float *w0 = W + (size_t)o * in_dim;
+            __m512 acc0 = _mm512_setzero_ps();
+
+            int k = 0;
+            for (; k + 16 <= in_dim; k += 16) {
+                __m512 xv = _mm512_loadu_ps(xrow + k);
+                acc0 = _mm512_fmadd_ps(xv, _mm512_loadu_ps(w0 + k), acc0);
+            }
+            if (k < in_dim) {
+                int rem = in_dim - k;
+                __mmask16 mask = (__mmask16)((1U << rem) - 1);
+                __m512 xv = _mm512_maskz_loadu_ps(mask, xrow + k);
+                acc0 = _mm512_fmadd_ps(xv, _mm512_maskz_loadu_ps(mask, w0 + k), acc0);
+            }
+            yrow[o] = _mm512_reduce_add_ps(acc0);
+        }
+    }
+}
+
+static void qwen_gemm_f32_threaded(float *y, const float *x, const float *W,
+                                     int seq_len, int in_dim, int out_dim) {
+    f32_gemm_task_t task = {
+        .y = y, .x = x, .W = W,
+        .seq_len = seq_len, .in_dim = in_dim, .out_dim = out_dim,
+    };
+    parallel_for(f32_gemm_worker, &task);
+}
+
+#define HAVE_F32_CUSTOM_GEMM 1
+#else
+#define HAVE_F32_CUSTOM_GEMM 0
+#endif /* __AVX512F__ f32 GEMM */
+
 void qwen_linear(float *y, const float *x, const float *W, const float *b,
                  int seq_len, int in_dim, int out_dim) {
+#if HAVE_F32_CUSTOM_GEMM
+    if (seq_len > 1) {
+        qwen_gemm_f32_threaded(y, x, W, seq_len, in_dim, out_dim);
+        if (b != NULL) {
+            for (int s = 0; s < seq_len; s++) {
+                for (int o = 0; o < out_dim; o++) {
+                    y[s * out_dim + o] += b[o];
+                }
+            }
+        }
+        return;
+    }
+#endif
 #ifdef USE_BLAS
     cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                 seq_len, out_dim, in_dim,
@@ -236,9 +340,29 @@ void qwen_linear_nobias(float *y, const float *x, const float *W,
 
 /* Convert bf16 buffer to f32 buffer */
 static void bf16_to_f32_buf(float *dst, const uint16_t *src, size_t n) {
+#if defined(__AVX2__) && (defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86))
+    /* AVX2 path: process 8 bf16 values at a time.
+     * Load 8x uint16 -> zero-extend to 8x uint32 -> shift left 16 -> store as f32.
+     * ~8x throughput vs scalar. */
+    size_t i = 0;
+    size_t n8 = n & ~(size_t)7;
+    for (; i < n8; i += 8) {
+        __m128i bf16_8 = _mm_loadu_si128((const __m128i *)(src + i));
+        __m256i i32_8 = _mm256_cvtepu16_epi32(bf16_8);
+        __m256i shifted = _mm256_slli_epi32(i32_8, 16);
+        _mm256_storeu_si256((__m256i *)(dst + i), shifted);
+    }
+    /* Handle remaining elements */
+    {
+        uint32_t *d = (uint32_t *)(void *)dst;
+        for (; i < n; i++)
+            d[i] = ((uint32_t)src[i]) << 16;
+    }
+#else
     uint32_t *d = (uint32_t *)(void *)dst;
     for (size_t i = 0; i < n; i++)
         d[i] = ((uint32_t)src[i]) << 16;
+#endif
 }
 
 /* Reusable scratch buffer for bf16->f32 conversion */
@@ -465,16 +589,218 @@ void qwen_linear_nobias_bf16_qkv(float *q, float *k, float *v, const float *x,
     parallel_for(qkv_matvec_worker, &task);
 }
 
+/* Profiling accumulators for bf16->f32 conversion vs GEMM */
+static double _prof_bf16_conv_ms = 0;
+static double _prof_gemm_ms = 0;
+static int _prof_gemm_count = 0;
+
+static double _kern_get_time_ms(void) {
+#if defined(_WIN32) || defined(_WIN64)
+    LARGE_INTEGER freq, count;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&count);
+    return (double)count.QuadPart / (double)freq.QuadPart * 1000.0;
+#else
+    return 0;
+#endif
+}
+
+void qwen_linear_nobias_bf16_prof_reset(void) {
+    _prof_bf16_conv_ms = 0;
+    _prof_gemm_ms = 0;
+    _prof_gemm_count = 0;
+}
+
+void qwen_linear_nobias_bf16_prof_print(void) {
+    if (_prof_gemm_count > 0) {
+        fprintf(stderr, "    [BF16 GEMM PROFILE] %d calls: conv=%.1fms gemm=%.1fms total=%.1fms (conv %.1f%%)\n",
+                _prof_gemm_count, _prof_bf16_conv_ms, _prof_gemm_ms,
+                _prof_bf16_conv_ms + _prof_gemm_ms,
+                100.0 * _prof_bf16_conv_ms / (_prof_bf16_conv_ms + _prof_gemm_ms));
+    }
+}
+
+/* ========================================================================
+ * AVX-512 BF16 native GEMM using VDPBF16PS
+ * y[seq_len, out_dim] = x[seq_len, in_dim] @ W_bf16[out_dim, in_dim]^T
+ * Both operands in bf16 for the dot product, f32 accumulation.
+ * ======================================================================== */
+#if defined(__AVX512BF16__) && defined(__AVX512F__) && (defined(__x86_64__) || defined(_M_X64))
+
+/* Convert f32 to bf16 with round-to-nearest-even (matching hardware behavior) */
+static void f32_to_bf16_buf(uint16_t *dst, const float *src, size_t n) {
+    size_t i = 0;
+#ifdef __AVX512BW__
+    /* AVX-512 path: convert 16 floats at a time using vcvtneps2bf16 */
+    size_t n16 = n & ~(size_t)15;
+    for (; i < n16; i += 16) {
+        __m512 f = _mm512_loadu_ps(src + i);
+        __m256bh b = _mm512_cvtneps_pbh(f);
+        _mm256_storeu_si256((__m256i *)(dst + i), (__m256i)b);
+    }
+#endif
+    /* Scalar fallback for remainder */
+    for (; i < n; i++) {
+        uint32_t bits;
+        memcpy(&bits, &src[i], 4);
+        /* Round to nearest even: add 0x7FFF + bit[16] for tie-breaking */
+        bits += (0x7FFFU + ((bits >> 16) & 1));
+        dst[i] = (uint16_t)(bits >> 16);
+    }
+}
+
+/* Thread task for bf16 GEMM */
+typedef struct {
+    float *y;                   /* output [seq_len, out_dim] */
+    const uint16_t *x_bf16;    /* input activations in bf16 [seq_len, in_dim] */
+    const uint16_t *W_bf16;    /* weights in bf16 [out_dim, in_dim] */
+    int seq_len;
+    int in_dim;
+    int out_dim;
+} bf16_gemm_task_t;
+
+static void bf16_gemm_worker(int tid, int n_threads, void *arg) {
+    bf16_gemm_task_t *t = (bf16_gemm_task_t *)arg;
+    const int seq_len = t->seq_len;
+    const int in_dim = t->in_dim;
+    const int out_dim = t->out_dim;
+    const uint16_t *x_bf16 = t->x_bf16;
+    const uint16_t *W_bf16 = t->W_bf16;
+    float *y = t->y;
+
+    /* Split output rows across threads */
+    int chunk = (out_dim + n_threads - 1) / n_threads;
+    int o_start = tid * chunk;
+    int o_end = o_start + chunk;
+    if (o_end > out_dim) o_end = out_dim;
+
+    for (int s = 0; s < seq_len; s++) {
+        const uint16_t *xrow = x_bf16 + (size_t)s * in_dim;
+        float *yrow = y + (size_t)s * out_dim;
+
+        int o = o_start;
+        /* Process 2 output rows at a time to amortize x loads */
+        for (; o + 1 < o_end; o += 2) {
+            const uint16_t *w0 = W_bf16 + (size_t)o * in_dim;
+            const uint16_t *w1 = w0 + in_dim;
+
+            __m512 acc0 = _mm512_setzero_ps();
+            __m512 acc1 = _mm512_setzero_ps();
+
+            int k = 0;
+            /* VDPBF16PS processes 32 bf16 elements (16 pairs) per instruction.
+             * Each __m512bh holds 32 bf16 values. */
+            for (; k + 32 <= in_dim; k += 32) {
+                __m512bh xv = (__m512bh)_mm512_loadu_si512(xrow + k);
+                __m512bh wv0 = (__m512bh)_mm512_loadu_si512(w0 + k);
+                __m512bh wv1 = (__m512bh)_mm512_loadu_si512(w1 + k);
+                acc0 = _mm512_dpbf16_ps(acc0, xv, wv0);
+                acc1 = _mm512_dpbf16_ps(acc1, xv, wv1);
+            }
+            /* Handle remaining elements (in_dim may not be multiple of 32) */
+            if (k < in_dim) {
+                int rem = in_dim - k;
+                __mmask32 mask = (__mmask32)((1ULL << rem) - 1);
+                __m512bh xv = (__m512bh)_mm512_maskz_loadu_epi16(mask, xrow + k);
+                __m512bh wv0 = (__m512bh)_mm512_maskz_loadu_epi16(mask, w0 + k);
+                __m512bh wv1 = (__m512bh)_mm512_maskz_loadu_epi16(mask, w1 + k);
+                acc0 = _mm512_dpbf16_ps(acc0, xv, wv0);
+                acc1 = _mm512_dpbf16_ps(acc1, xv, wv1);
+            }
+
+            yrow[o]     = _mm512_reduce_add_ps(acc0);
+            yrow[o + 1] = _mm512_reduce_add_ps(acc1);
+        }
+        /* Handle last odd output row */
+        if (o < o_end) {
+            const uint16_t *w0 = W_bf16 + (size_t)o * in_dim;
+            __m512 acc0 = _mm512_setzero_ps();
+
+            int k = 0;
+            for (; k + 32 <= in_dim; k += 32) {
+                __m512bh xv = (__m512bh)_mm512_loadu_si512(xrow + k);
+                __m512bh wv0 = (__m512bh)_mm512_loadu_si512(w0 + k);
+                acc0 = _mm512_dpbf16_ps(acc0, xv, wv0);
+            }
+            if (k < in_dim) {
+                int rem = in_dim - k;
+                __mmask32 mask = (__mmask32)((1ULL << rem) - 1);
+                __m512bh xv = (__m512bh)_mm512_maskz_loadu_epi16(mask, xrow + k);
+                __m512bh wv0 = (__m512bh)_mm512_maskz_loadu_epi16(mask, w0 + k);
+                acc0 = _mm512_dpbf16_ps(acc0, xv, wv0);
+            }
+            yrow[o] = _mm512_reduce_add_ps(acc0);
+        }
+    }
+}
+
+/* Reusable buffer for f32->bf16 conversion of activations */
+static uint16_t *bf16_x_scratch = NULL;
+static size_t bf16_x_scratch_cap = 0;
+
+static uint16_t *bf16_get_x_scratch(size_t n) {
+    if (n > bf16_x_scratch_cap) {
+        free(bf16_x_scratch);
+        bf16_x_scratch = (uint16_t *)malloc(n * sizeof(uint16_t));
+        bf16_x_scratch_cap = bf16_x_scratch ? n : 0;
+    }
+    return bf16_x_scratch;
+}
+
+/* Main entry: threaded bf16 GEMM using VDPBF16PS */
+static void qwen_gemm_bf16_native(float *y, const float *x, const uint16_t *W_bf16,
+                                   int seq_len, int in_dim, int out_dim) {
+    size_t x_elems = (size_t)seq_len * in_dim;
+    uint16_t *x_bf16 = bf16_get_x_scratch(x_elems);
+    if (!x_bf16) return;
+
+    /* Convert activations f32 -> bf16 (small: typically 40-120 × 1024 = 40-120KB) */
+    f32_to_bf16_buf(x_bf16, x, x_elems);
+
+    bf16_gemm_task_t task = {
+        .y = y,
+        .x_bf16 = x_bf16,
+        .W_bf16 = W_bf16,
+        .seq_len = seq_len,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+    };
+    parallel_for(bf16_gemm_worker, &task);
+}
+
+#define HAVE_BF16_NATIVE_GEMM 1
+#else
+#define HAVE_BF16_NATIVE_GEMM 0
+#endif /* __AVX512BF16__ */
+
 void qwen_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
                               int seq_len, int in_dim, int out_dim) {
     if (seq_len == 1) {
         bf16_matvec_threaded(y, x, W_bf16, NULL, in_dim, out_dim);
         return;
     }
+
+#if HAVE_BF16_NATIVE_GEMM
+    double t0 = _kern_get_time_ms();
+    qwen_gemm_bf16_native(y, x, W_bf16, seq_len, in_dim, out_dim);
+    double t1 = _kern_get_time_ms();
+    _prof_gemm_ms += t1 - t0;
+    _prof_gemm_count++;
+#else
     size_t n = (size_t)out_dim * in_dim;
+
+    double t0 = _kern_get_time_ms();
     const float *W_f32 = bf16_get_f32_view(W_bf16, n);
     if (!W_f32) return;
+    double t1 = _kern_get_time_ms();
+
     qwen_linear_nobias(y, x, W_f32, seq_len, in_dim, out_dim);
+    double t2 = _kern_get_time_ms();
+
+    _prof_bf16_conv_ms += t1 - t0;
+    _prof_gemm_ms += t2 - t1;
+    _prof_gemm_count++;
+#endif
 }
 
 void qwen_linear_bf16(float *y, const float *x, const uint16_t *W_bf16,

@@ -18,6 +18,23 @@
 #include <string.h>
 #include <math.h>
 
+#if defined(_WIN32) || defined(_WIN64)
+#include <windows.h>
+static double dec_get_time_ms(void) {
+    LARGE_INTEGER freq, count;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&count);
+    return (double)count.QuadPart / (double)freq.QuadPart * 1000.0;
+}
+#else
+#include <sys/time.h>
+static double dec_get_time_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+}
+#endif
+
 /* ========================================================================
  * Weight Loading
  * ======================================================================== */
@@ -301,61 +318,135 @@ void qwen_decoder_prefill(qwen_ctx_t *ctx, const float *input_embeds, int seq_le
 
     float scale = 1.0f / sqrtf((float)head_dim);
 
-    for (int layer = 0; layer < cfg->dec_layers; layer++) {
+    /* Profiling accumulators */
+    double prof_rms_norm_ms = 0, prof_qkv_proj_ms = 0, prof_qk_norm_rope_ms = 0;
+    double prof_kv_store_ms = 0, prof_attn_ms = 0, prof_out_proj_ms = 0;
+    double prof_ffn_gate_up_ms = 0, prof_ffn_swiglu_ms = 0, prof_ffn_down_ms = 0;
+    double prof_residual_ms = 0;
+    double t0;
+
+    if (qwen_verbose >= 2) qwen_linear_nobias_bf16_prof_reset();
+
+    int n_layers = cfg->dec_layers;
+    if (ctx->dec_layers_limit > 0 && ctx->dec_layers_limit < n_layers)
+        n_layers = ctx->dec_layers_limit;
+
+    for (int layer = 0; layer < n_layers; layer++) {
         qwen_dec_layer_t *l = &dec->layers[layer];
 
         /* Input RMSNorm */
+        t0 = dec_get_time_ms();
         qwen_rms_norm(x_norm, x, l->input_norm, seq_len, dim, eps);
+        prof_rms_norm_ms += dec_get_time_ms() - t0;
 
-        /* QKV projections (no bias) */
+        /* QKV projections (no bias) — includes bf16->f32 conversion */
+        t0 = dec_get_time_ms();
         qwen_linear_nobias_bf16(q, x_norm, l->wq_weight_bf16, seq_len, dim, q_dim);
         qwen_linear_nobias_bf16(k, x_norm, l->wk_weight_bf16, seq_len, dim, kv_dim);
         qwen_linear_nobias_bf16(v, x_norm, l->wv_weight_bf16, seq_len, dim, kv_dim);
+        prof_qkv_proj_ms += dec_get_time_ms() - t0;
 
-        /* Per-head Q/K RMSNorm */
+        /* Per-head Q/K RMSNorm + NeoX RoPE */
+        t0 = dec_get_time_ms();
         qwen_rms_norm_per_head(q, l->q_norm_weight, seq_len, n_heads, head_dim, eps);
         qwen_rms_norm_per_head(k, l->k_norm_weight, seq_len, n_kv_heads, head_dim, eps);
-
-        /* Apply NeoX RoPE */
         qwen_apply_rope_neox(q, rope_cos, rope_sin, seq_len, n_heads, head_dim);
         qwen_apply_rope_neox(k, rope_cos, rope_sin, seq_len, n_kv_heads, head_dim);
+        prof_qk_norm_rope_ms += dec_get_time_ms() - t0;
 
         /* Store K, V in cache */
+        t0 = dec_get_time_ms();
         for (int s = 0; s < seq_len; s++) {
             memcpy(kv_cache_k_at(ctx, layer, start_pos + s),
                    k + s * kv_dim, kv_dim * sizeof(float));
             memcpy(kv_cache_v_at(ctx, layer, start_pos + s),
                    v + s * kv_dim, kv_dim * sizeof(float));
         }
+        prof_kv_store_ms += dec_get_time_ms() - t0;
 
         /* Causal attention */
+        t0 = dec_get_time_ms();
         int total_seq = start_pos + seq_len;
         float *full_k = kv_cache_k_at(ctx, layer, 0);
         float *full_v = kv_cache_v_at(ctx, layer, 0);
         qwen_causal_attention(attn_out, q, full_k, full_v,
                                seq_len, total_seq, n_heads, n_kv_heads,
                                head_dim, scale, start_pos);
+        prof_attn_ms += dec_get_time_ms() - t0;
 
         /* Output projection + residual */
+        t0 = dec_get_time_ms();
         qwen_linear_nobias_bf16(proj_out, attn_out, l->wo_weight_bf16,
                                  seq_len, q_dim, dim);
+        prof_out_proj_ms += dec_get_time_ms() - t0;
+
+        t0 = dec_get_time_ms();
         qwen_add_inplace(x, proj_out, seq_len * dim);
+        prof_residual_ms += dec_get_time_ms() - t0;
 
         /* Post-attention RMSNorm */
+        t0 = dec_get_time_ms();
         qwen_rms_norm(x_norm, x, l->post_attn_norm, seq_len, dim, eps);
+        prof_rms_norm_ms += dec_get_time_ms() - t0;
 
-        /* SwiGLU MLP */
+        /* SwiGLU MLP — gate_up projection (includes bf16->f32) */
+        t0 = dec_get_time_ms();
         qwen_linear_nobias_bf16(gate_up, x_norm, l->gate_up_fused_bf16,
                                  seq_len, dim, 2 * intermediate);
+        prof_ffn_gate_up_ms += dec_get_time_ms() - t0;
+
+        t0 = dec_get_time_ms();
         qwen_swiglu_multiply(gate, gate_up, seq_len, intermediate);
+        prof_ffn_swiglu_ms += dec_get_time_ms() - t0;
+
+        t0 = dec_get_time_ms();
         qwen_linear_nobias_bf16(ffn_out, gate, l->down_weight_bf16,
                                  seq_len, intermediate, dim);
+        prof_ffn_down_ms += dec_get_time_ms() - t0;
 
+        t0 = dec_get_time_ms();
         qwen_add_inplace(x, ffn_out, seq_len * dim);
+        prof_residual_ms += dec_get_time_ms() - t0;
 
     }
 
     ctx->kv_cache_len = start_pos + seq_len;
+
+    if (qwen_verbose >= 2) {
+        double total = prof_rms_norm_ms + prof_qkv_proj_ms + prof_qk_norm_rope_ms
+                     + prof_kv_store_ms + prof_attn_ms + prof_out_proj_ms
+                     + prof_residual_ms + prof_ffn_gate_up_ms + prof_ffn_swiglu_ms
+                     + prof_ffn_down_ms;
+        fprintf(stderr,
+            "  [PREFILL PROFILE] seq=%d start_pos=%d layers=%d total=%.1fms\n"
+            "    QKV proj:     %7.1fms (%4.1f%%)  [bf16->f32 + GEMM: Q(%dx%d->%d) K(%dx%d->%d) V(%dx%d->%d)]\n"
+            "    Attn (causal): %6.1fms (%4.1f%%)  [%d q-tokens x %d kv-len, %d heads]\n"
+            "    Out proj:     %7.1fms (%4.1f%%)  [bf16->f32 + GEMM: %dx%d->%d]\n"
+            "    FFN gate_up:  %7.1fms (%4.1f%%)  [bf16->f32 + GEMM: %dx%d->%d]\n"
+            "    FFN down:     %7.1fms (%4.1f%%)  [bf16->f32 + GEMM: %dx%d->%d]\n"
+            "    RMSNorm:      %7.1fms (%4.1f%%)\n"
+            "    QK norm+RoPE: %7.1fms (%4.1f%%)\n"
+            "    KV store:     %7.1fms (%4.1f%%)\n"
+            "    SwiGLU:       %7.1fms (%4.1f%%)\n"
+            "    Residual add: %7.1fms (%4.1f%%)\n",
+            seq_len, start_pos, cfg->dec_layers, total,
+            prof_qkv_proj_ms, 100.0 * prof_qkv_proj_ms / total,
+            seq_len, dim, q_dim, seq_len, dim, kv_dim, seq_len, dim, kv_dim,
+            prof_attn_ms, 100.0 * prof_attn_ms / total,
+            seq_len, start_pos + seq_len, n_heads,
+            prof_out_proj_ms, 100.0 * prof_out_proj_ms / total,
+            seq_len, q_dim, dim,
+            prof_ffn_gate_up_ms, 100.0 * prof_ffn_gate_up_ms / total,
+            seq_len, dim, 2 * intermediate,
+            prof_ffn_down_ms, 100.0 * prof_ffn_down_ms / total,
+            seq_len, intermediate, dim,
+            prof_rms_norm_ms, 100.0 * prof_rms_norm_ms / total,
+            prof_qk_norm_rope_ms, 100.0 * prof_qk_norm_rope_ms / total,
+            prof_kv_store_ms, 100.0 * prof_kv_store_ms / total,
+            prof_ffn_swiglu_ms, 100.0 * prof_ffn_swiglu_ms / total,
+            prof_residual_ms, 100.0 * prof_residual_ms / total);
+        qwen_linear_nobias_bf16_prof_print();
+    }
 }
 
 /* ========================================================================
@@ -425,7 +516,11 @@ int qwen_decoder_forward(qwen_ctx_t *ctx, const float *input_embed) {
 
     float scale = 1.0f / sqrtf((float)head_dim);
 
-    for (int layer = 0; layer < cfg->dec_layers; layer++) {
+    int n_layers_fwd = cfg->dec_layers;
+    if (ctx->dec_layers_limit > 0 && ctx->dec_layers_limit < n_layers_fwd)
+        n_layers_fwd = ctx->dec_layers_limit;
+
+    for (int layer = 0; layer < n_layers_fwd; layer++) {
         qwen_dec_layer_t *l = &dec->layers[layer];
 
         qwen_rms_norm(x_norm, x, l->input_norm, 1, dim, eps);

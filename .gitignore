@@ -1,4 +1,9 @@
 *.o
+*.exe
+*.dll
+/err*.txt
+/out*.txt
+/stream_*.txt
 qwen_asr
 venv/
 venv312/

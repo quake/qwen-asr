@@ -41,6 +41,10 @@ void qwen_linear_bf16(float *y, const float *x, const uint16_t *W_bf16,
 void qwen_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
                               int seq_len, int in_dim, int out_dim);
 
+/* Profiling helpers for bf16->f32 conversion vs GEMM */
+void qwen_linear_nobias_bf16_prof_reset(void);
+void qwen_linear_nobias_bf16_prof_print(void);
+
 /* seq=1 decoder fast path: compute Q/K/V matvecs with one threaded dispatch */
 void qwen_linear_nobias_bf16_qkv(float *q, float *k, float *v, const float *x,
                                  const uint16_t *Wq_bf16,

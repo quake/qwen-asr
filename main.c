@@ -66,6 +66,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --language <lang>          Force output language via token conditioning\n");
     fprintf(stderr, "                             (usually auto-detected if omitted)\n");
     fprintf(stderr, "  --monitor     Show inline Unicode symbols on stderr (streaming diagnostics)\n");
+    fprintf(stderr, "  --dec-layers <n>           Limit decoder to first N layers (default: all)\n");
     fprintf(stderr, "  --debug       Debug output (per-layer details)\n");
     fprintf(stderr, "  --silent      No status output (only final transcription on stdout)\n");
     fprintf(stderr, "                 with -i + --stream, uses non-interactive final refinement\n");
@@ -87,6 +88,8 @@ int main(int argc, char **argv) {
     const char *force_language = NULL;
     int past_text_conditioning_mode = -1; /* -1 auto, 0 off, 1 on */
     int skip_silence = 0;
+    float stream_chunk_sec = -1; /* -1 = use default (2.0) */
+    int dec_layers_limit = 0;    /* 0 = use all layers */
     int emit_tokens = 1;
 
     for (int i = 1; i < argc; i++) {
@@ -104,6 +107,8 @@ int main(int argc, char **argv) {
             stream_mode = 1;
         } else if (strcmp(argv[i], "--stream-max-new-tokens") == 0 && i + 1 < argc) {
             stream_max_new_tokens = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--chunk-sec") == 0 && i + 1 < argc) {
+            stream_chunk_sec = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--enc-window-sec") == 0 && i + 1 < argc) {
             enc_window_sec = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--past-text") == 0 && i + 1 < argc) {
@@ -125,6 +130,8 @@ int main(int argc, char **argv) {
             use_stdin = 1;
         } else if (strcmp(argv[i], "--monitor") == 0) {
             qwen_monitor = 1;
+        } else if (strcmp(argv[i], "--dec-layers") == 0 && i + 1 < argc) {
+            dec_layers_limit = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--debug") == 0) {
             verbosity = 2;
         } else if (strcmp(argv[i], "--silent") == 0) {
@@ -180,6 +187,7 @@ int main(int argc, char **argv) {
         ctx->config.enc_n_window_infer = window_frames;
     }
     if (stream_max_new_tokens > 0) ctx->stream_max_new_tokens = stream_max_new_tokens;
+    if (stream_chunk_sec > 0) qwen_set_stream_chunk_sec(ctx, stream_chunk_sec);
     if (past_text_conditioning_mode >= 0)
         ctx->past_text_conditioning = past_text_conditioning_mode;
     else if (stream_mode)
@@ -187,6 +195,7 @@ int main(int argc, char **argv) {
          * Keep segmented mode default unchanged (off). */
         ctx->past_text_conditioning = 1;
     if (skip_silence) ctx->skip_silence = 1;
+    if (dec_layers_limit > 0) qwen_set_dec_layers_limit(ctx, dec_layers_limit);
     if (prompt_text && qwen_set_prompt(ctx, prompt_text) != 0) {
         fprintf(stderr, "Failed to set --prompt text\n");
         qwen_free(ctx);
