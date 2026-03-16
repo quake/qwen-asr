@@ -1874,12 +1874,13 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
         double decode_ms = get_time_ms() - t0;
         ctx->perf_decode_ms += decode_ms;
         if (qwen_verbose >= 2)
-            fprintf(stderr, "  Decode: %d tokens (%.0f ms, %.1f ms/token%s)\n",
+            fprintf(stderr, "  Decode: %d tokens (%.0f ms, %.1f ms/token%s), kv_len=%d\n",
                     n_generated, decode_ms,
                     n_generated > 0 ? decode_ms / n_generated : 0,
                     (n_generated >= max_new_tokens &&
                      token != QWEN_TOKEN_ENDOFTEXT &&
-                     token != QWEN_TOKEN_IM_END) ? ", hit max_new" : "");
+                     token != QWEN_TOKEN_IM_END) ? ", hit max_new" : "",
+                    ctx->kv_cache_len);
         if (qwen_monitor) {
             /* ▪ = normal decode, ▸ = slow (>30ms/token) */
             double ms_per_tok = n_generated > 0 ? decode_ms / n_generated : 0;
@@ -1986,6 +1987,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
         int *candidate_tokens = raw_tokens + text_start;
         int did_recovery_reset = 0;
         int did_periodic_reset = 0;
+        int kv_len_before_reset = 0;
         {
             int tail_period = 0;
             int tail_reps = stream_tail_repeat_blocks(candidate_tokens, candidate_len,
@@ -2107,6 +2109,9 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                      chunk_idx >= unfixed_chunks &&
                      ((chunk_idx + 1) % QWEN_STREAM_RESET_INTERVAL_CHUNKS == 0));
                 if (periodic_reset) {
+                    kv_len_before_reset = ctx->kv_cache_len;
+                    if (qwen_verbose >= 2)
+                        fprintf(stderr, "  [Periodic reset triggered: kv_len=%d]\n", kv_len_before_reset);
                     if (stream_reanchor_text_state(ctx,
                                                    emitted_text_tokens,
                                                    n_emitted_text_tokens,
@@ -2118,6 +2123,7 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
                         n_stable_text_tokens = 0;
                     }
                     prev_prefill_len = 0;
+                    qwen_reset_kv_cache(ctx);  /* Reset KV cache to prevent unbounded growth */
                     stream_clear_enc_cache(enc_cache,
                                            &n_enc_cache,
                                            &enc_cache_start,
@@ -2136,10 +2142,10 @@ static char *stream_impl(qwen_ctx_t *ctx, const float *samples, int n_samples,
             if (did_recovery_reset) {
                 fprintf(stderr, "  Recovery reset applied\n");
             } else if (did_periodic_reset) {
-                fprintf(stderr, "  Periodic reset applied\n");
+                fprintf(stderr, "  Periodic reset applied (KV cache cleared: %d -> 0)\n", kv_len_before_reset);
             }
-            fprintf(stderr, "  Commit: candidate=%d tokens, emitted_total=%d\n",
-                    candidate_len, n_stable_text_tokens);
+            fprintf(stderr, "  Commit: candidate=%d tokens, emitted_total=%d, kv_len=%d\n",
+                    candidate_len, n_stable_text_tokens, ctx->kv_cache_len);
         }
 
         if (live && use_enc_cache) {
